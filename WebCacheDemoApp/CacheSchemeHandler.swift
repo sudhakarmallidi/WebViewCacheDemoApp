@@ -1,5 +1,6 @@
 import Foundation
 import WebKit
+import Combine
 import CryptoKit
 
 struct DaasWebView {
@@ -35,11 +36,13 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
     private let stateQueue = DispatchQueue(label: "com.cachehandler.state", attributes: .concurrent)
 
     // Use ObjectIdentifier for protocol-based keys
-    private var activeTasks = [ObjectIdentifier: URLSessionDataTask]()
+    private var activeCancellables = [ObjectIdentifier: AnyCancellable]()
 
     // Deduplication: Track ongoing downloads to avoid duplicate requests
     // (No change needed here, since WKURLSchemeTask is not a key)
     private var ongoingDownloads = [String: [(task: WKURLSchemeTask, cachePath: URL?)]]()
+
+    private let downloadService = DownloadService()
 
     // Concurrent queue for I/O operations (reads are concurrent, writes use .barrier)
     private let ioQueue = DispatchQueue(label: "com.cachehandler.io", qos: .userInitiated, attributes: .concurrent)
@@ -88,12 +91,10 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         let taskID = ObjectIdentifier(urlSchemeTask)
         stateQueue.sync {
-            if let dataTask = activeTasks[taskID] {
-                dataTask.cancel()
-            }
+            activeCancellables[taskID]?.cancel()
         }
         stateQueue.async(flags: .barrier) {
-            self.activeTasks.removeValue(forKey: taskID)
+            self.activeCancellables.removeValue(forKey: taskID)
         }
     }
 
@@ -131,72 +132,60 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
         var request = URLRequest(url: actualURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
-        let dataTask = urlSession.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { return }
-            var waitingTasks: [(task: WKURLSchemeTask, cachePath: URL?)] = []
-
-            // Atomically grab and clear waiting tasks
-            self.stateQueue.sync(flags: .barrier) {
-                waitingTasks = self.ongoingDownloads[urlKey] ?? []
-                self.ongoingDownloads.removeValue(forKey: urlKey)
-            }
-
-            if let error = error {
-                print("❗️ Download failed for \(actualURL): \(error.localizedDescription)")
-                DispatchQueue.main.async {
-                    for (task, _) in waitingTasks {
-                        task.didFailWithError(error)
-                    }
-                }
-                return
-            }
-
-            guard let data = data, let response = response else {
-                let msg = "No data received for \(actualURL)"
-                print("❗️ Download failed: \(msg)")
-                let error = NSError(domain: "CacheError", code: -1, userInfo: [NSLocalizedDescriptionKey: msg])
-                DispatchQueue.main.async {
-                    for (task, _) in waitingTasks {
-                        task.didFailWithError(error)
-                    }
-                }
-                return
-            }
-
-            // Cache (if needed), but don't block response for file I/O
-            if let cachePath = cachePath {
-                self.ioQueue.async(flags: .barrier) {
-                    do {
-                        try data.write(to: cachePath, options: .atomic)
-                        print("✅ Cached '\(cachePath.lastPathComponent)' at \(cachePath.path)")
-                    } catch {
-                        print("❗️ Failed to write to cache '\(cachePath.lastPathComponent)': \(error.localizedDescription)")
-                    }
-                }
-            }
-
-            print("⬇️ Download completed for \(actualURL): \(data.count) bytes")
-            // Respond on main thread, as required by WKURLSchemeHandler
-            DispatchQueue.main.async {
-                for (task, _) in waitingTasks {
-                    let taskID = ObjectIdentifier(task)
-                    self.stateQueue.async(flags: .barrier) {
-                        self.activeTasks.removeValue(forKey: taskID)
-                    }
-                    task.didReceive(response)
-                    task.didReceive(data)
-                    task.didFinish()
-                }
-            }
-        }
-
-        // Track the data task for cancellation, using ObjectIdentifier
         let taskID = ObjectIdentifier(urlSchemeTask)
-        stateQueue.async(flags: .barrier) {
-            self.activeTasks[taskID] = dataTask
-        }
         print("🌐 Starting download for \(actualURL)")
-        dataTask.resume()
+        let cancellable = downloadService
+            .fetch(request: request, session: urlSession)
+            .sink(receiveCompletion: { [weak self] completion in
+                guard let self = self else { return }
+                var waitingTasks: [(task: WKURLSchemeTask, cachePath: URL?)] = []
+                self.stateQueue.sync(flags: .barrier) {
+                    waitingTasks = self.ongoingDownloads[urlKey] ?? []
+                    self.ongoingDownloads.removeValue(forKey: urlKey)
+                }
+                switch completion {
+                case .failure(let error):
+                    print("❗️ Download failed for \(actualURL): \(error.localizedDescription)")
+                    DispatchQueue.main.async {
+                        for (task, _) in waitingTasks {
+                            task.didFailWithError(error)
+                        }
+                    }
+                case .finished:
+                    break
+                }
+                self.stateQueue.async(flags: .barrier) {
+                    self.activeCancellables.removeValue(forKey: taskID)
+                }
+            }, receiveValue: { [weak self] data, response in
+                guard let self = self else { return }
+                var waitingTasks: [(task: WKURLSchemeTask, cachePath: URL?)] = []
+                self.stateQueue.sync(flags: .barrier) {
+                    waitingTasks = self.ongoingDownloads[urlKey] ?? []
+                }
+                if let cachePath = cachePath {
+                    self.ioQueue.async(flags: .barrier) {
+                        do {
+                            try data.write(to: cachePath, options: .atomic)
+                            print("✅ Cached '\(cachePath.lastPathComponent)' at \(cachePath.path)")
+                        } catch {
+                            print("❗️ Failed to write to cache '\(cachePath.lastPathComponent)': \(error.localizedDescription)")
+                        }
+                    }
+                }
+                print("⬇️ Download completed for \(actualURL): \(data.count) bytes")
+                DispatchQueue.main.async {
+                    for (task, _) in waitingTasks {
+                        task.didReceive(response)
+                        task.didReceive(data)
+                        task.didFinish()
+                    }
+                }
+            })
+
+        stateQueue.async(flags: .barrier) {
+            self.activeCancellables[taskID] = cancellable
+        }
     }
 
     // MARK: - Utility Methods
