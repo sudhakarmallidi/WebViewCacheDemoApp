@@ -1,5 +1,6 @@
 import Foundation
 import WebKit
+import CryptoKit
 
 struct DaasWebView {
     static let scheme: String = "x-file"
@@ -20,9 +21,9 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
     // Optimized: Use a concurrent OperationQueue with ~8-12 max concurrent ops
     private lazy var urlSession: URLSession = {
         let opQueue = OperationQueue()
-        opQueue.maxConcurrentOperationCount = 10
+        opQueue.maxConcurrentOperationCount = 16
         let config = URLSessionConfiguration.default
-        config.httpMaximumConnectionsPerHost = 8
+        config.httpMaximumConnectionsPerHost = 16
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 60
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -200,42 +201,13 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
 
     // MARK: - Utility Methods
 
-    private func generateCacheFileName(from url: URL) -> String {
-        var pathComponent = url.path.isEmpty ? "/" : url.path
-        if pathComponent.hasPrefix("/") {
-            pathComponent = String(pathComponent.dropFirst())
-        }
-        var cacheKey = pathComponent.isEmpty ? "index" : pathComponent
-        if let query = url.query, !query.isEmpty {
-            let queryHash = String(query.hash & 0x7FFFFFFF)
-            cacheKey += "_\(queryHash)"
-        }
-        cacheKey = cacheKey.replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "\\", with: "_")
-            .replacingOccurrences(of: ":", with: "_")
-            .replacingOccurrences(of: "*", with: "_")
-            .replacingOccurrences(of: "?", with: "_")
-            .replacingOccurrences(of: "\"", with: "_")
-            .replacingOccurrences(of: "<", with: "_")
-            .replacingOccurrences(of: ">", with: "_")
-            .replacingOccurrences(of: "|", with: "_")
-        if cacheKey.count > 200 {
-            let hash = cacheKey.hash
-            let ext = (cacheKey as NSString).pathExtension
-            cacheKey = cacheKey.prefix(150) + "_\(String(hash & 0x7FFFFFFF))"
-            if !ext.isEmpty {
-                cacheKey += ".\(ext)"
-            }
-        }
-        if (cacheKey as NSString).pathExtension.isEmpty {
-            let lastPath = url.lastPathComponent
-            let ext = (lastPath as NSString).pathExtension
-            if !ext.isEmpty {
-                cacheKey += ".\(ext)"
-            }
-        }
-        return cacheKey.isEmpty ? "unknown_\(url.hash)" : cacheKey
-    }
+	private func generateCacheFileName(from url: URL) -> String {
+		let urlString = url.absoluteString
+		let digest = Insecure.MD5.hash(data: Data(urlString.utf8))
+		let md5 = digest.map { String(format: "%02hhx", $0) }.joined()
+		let ext = (url.lastPathComponent as NSString).pathExtension
+		return ext.isEmpty ? md5 : "\(md5).\(ext)"
+	}
 
     private func shouldCacheResource(fileName: String, url: URL) -> Bool {
         let ext = (fileName as NSString).pathExtension.lowercased()
