@@ -52,6 +52,13 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         guard let url = urlSchemeTask.request.url else { return }
 
+        // Check if this is an API call - if so, bypass caching entirely
+        if isAPICall(request: urlSchemeTask.request, url: url) {
+            print("🚫 API call detected: Bypassing cache for \(url.absoluteString)")
+            startDownload(url: url, urlSchemeTask: urlSchemeTask, cachePath: nil)
+            return
+        }
+
         let cacheFileName = generateCacheFileName(from: url)
         let cachePath = cacheDirectory.appendingPathComponent(cacheFileName)
         let shouldCache = shouldCacheResource(fileName: cacheFileName, url: url)
@@ -190,6 +197,84 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
 
     // MARK: - Utility Methods
 
+    /// Detects if a request is an API call using multiple heuristics
+    internal func isAPICall(request: URLRequest, url: URL) -> Bool {
+        // 1. Check HTTP method - state-changing methods are typically APIs
+        let httpMethod = request.httpMethod?.uppercased() ?? "GET"
+        let apiMethods = ["POST", "PUT", "DELETE", "PATCH"]
+        if apiMethods.contains(httpMethod) {
+            return true
+        }
+
+        // 2. Check URL path patterns for common API endpoints
+        let path = url.path.lowercased()
+        let apiPathPatterns = [
+            "/api/", "/rest/", "/graphql", "/graphiql",
+            "/v1/", "/v2/", "/v3/", "/v4/", "/v5/",
+            "/endpoint", "/endpoints", "/service", "/services",
+            "/rpc", "/rpc/", "/soap", "/soap/",
+            "/oauth", "/auth", "/token", "/login", "/logout",
+            "/webhook", "/webhooks", "/callback", "/callbacks"
+        ]
+        for pattern in apiPathPatterns {
+            if path.contains(pattern) {
+                return true
+            }
+        }
+
+        // 3. Check Content-Type header
+        if let contentType = request.value(forHTTPHeaderField: "Content-Type")?.lowercased() {
+            let apiContentTypes = [
+                "application/json", "application/xml", "application/x-www-form-urlencoded",
+                "multipart/form-data", "application/soap+xml", "application/x-protobuf"
+            ]
+            if apiContentTypes.contains(where: { contentType.contains($0) }) {
+                return true
+            }
+        }
+
+        // 4. Check Accept header
+        if let accept = request.value(forHTTPHeaderField: "Accept")?.lowercased() {
+            let apiAcceptTypes = [
+                "application/json", "application/xml", "application/vnd.api+json",
+                "application/hal+json", "application/problem+json"
+            ]
+            if apiAcceptTypes.contains(where: { accept.contains($0) }) {
+                return true
+            }
+        }
+
+        // 5. Check if URL has no file extension (APIs often don't have extensions)
+        let pathExtension = (url.lastPathComponent as NSString).pathExtension.lowercased()
+        let hasStaticFileExtension = ["js", "css", "html", "htm", "png", "jpg", "jpeg", "gif", "svg",
+                                      "woff", "woff2", "ttf", "eot", "ico", "pdf", "zip", "mp4", "mp3"].contains(pathExtension)
+        if !hasStaticFileExtension && !pathExtension.isEmpty {
+            // Has extension but not a static file type - might be API
+            let apiExtensions = ["json", "xml"]
+            if apiExtensions.contains(pathExtension) && path.contains("/api/") {
+                return true
+            }
+        }
+
+        // 6. Check query parameters that suggest API calls
+        if let query = url.query?.lowercased() {
+            let apiQueryParams = ["callback=", "format=json", "format=xml", "api_key=", "access_token="]
+            if apiQueryParams.contains(where: { query.contains($0) }) {
+                return true
+            }
+        }
+
+        // 7. Check host/subdomain patterns
+        if let host = url.host?.lowercased() {
+            let apiHostPatterns = ["api.", "rest.", "service.", "backend.", "server."]
+            if apiHostPatterns.contains(where: { host.hasPrefix($0) }) {
+                return true
+            }
+        }
+
+        return false
+    }
+
 	private func generateCacheFileName(from url: URL) -> String {
 		let urlString = url.absoluteString
 		let digest = Insecure.MD5.hash(data: Data(urlString.utf8))
@@ -199,10 +284,15 @@ class CacheSchemeHandler: NSObject, WKURLSchemeHandler {
 	}
 
     private func shouldCacheResource(fileName: String, url: URL) -> Bool {
+        // Additional safeguard: check for API patterns in the URL
+        let path = url.path.lowercased()
+        if path.contains("/api/") || path.contains("/rest/") || path.contains("/graphql") {
+            return false
+        }
+
         let ext = (fileName as NSString).pathExtension.lowercased()
         let shouldCacheExtensions = ["js", "css", "woff", "woff2", "ttf", "eot", "png", "jpg", "jpeg", "gif", "svg", "json"]
         if shouldCacheExtensions.contains(ext) { return true }
-        let path = url.path.lowercased()
         if path.contains("/static/") || path.contains("/assets/") ||
             path.contains("/build/") || path.contains("/dist/") ||
             path.contains("/public/") { return true }
